@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Speaker Timer (Segment Dropdown + Min/Max + Buffer)</title>
+  <style>
+    body { font-family: Segoe UI, Arial, sans-serif; margin: 24px; max-width: 1200px; }
+    h1 { margin: 0 0 10px; }
+    .muted { color:#666; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:10px 0; }
+    input[type="text"], input[type="number"], select { padding:10px; font-size:14px; }
+    input#contestantInput { width:140px; }
+    input#nameInput { width:220px; }
+    input#topicInput { width:320px; }
+    select#segmentSelect { width:260px; }
+    input#minInput, input#maxInput, input#bufferInput { width:140px; }
+    button { padding:10px 12px; font-size:14px; cursor:pointer; }
+    table { width:100%; border-collapse:collapse; margin-top:14px; }
+    th, td { border:1px solid #ddd; padding:10px; text-align:left; vertical-align:top; }
+    th { background:#f6f6f6; }
+    .right { text-align:right; white-space:nowrap; }
+    .nowrap { white-space:nowrap; }
+    .active { outline:2px solid #2ecc71; outline-offset:-2px; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; margin-left:6px; }
+    .pill-green { background:#e8fff0; color:#0b6b2f; border:1px solid #b7f2c7; }
+    .pill-yellow { background:#fff7db; color:#7a5a00; border:1px solid #ffe4a3; }
+    .pill-red { background:#ffe9e9; color:#8a1c1c; border:1px solid #ffc2c2; }
+    .small { font-size:12px; }
+    .cell-input { width:90px; padding:6px; font-size:13px; }
+    .row-green { background:#f4fff8; }
+    .row-yellow { background:#fffdf2; }
+    .row-red { background:#fff5f5; }
+  </style>
+</head>
+<body>
+  <h1>Speaker Timer (Segment Dropdown + 30s Buffer)</h1>
+  <div class="muted">
+    Status colors:
+    Green = within min..max. Yellow = within grace zone (min-buffer..min OR max..max+buffer). Red = outside grace → not qualified.
+  </div>
+
+  <div class="row">
+    <input id="bufferInput" type="number" min="0" value="30" title="Grace/buffer seconds" />
+    <span class="muted small">Buffer (seconds). Default 30s (grace before/after limits). </span>
+  </div>
+
+  <div class="row">
+    <select id="segmentSelect" title="Select segment type to auto-fill min/max">
+      <!-- Presets grounded in Meeting-Roles + your TTM script -->
+      <option value="Table Topics">Table Topics (1–2 min)</option>
+      <option value="Evaluation">Evaluation (2–3 min)</option>
+      <option value="General Evaluation">General Evaluation (2–3 min)</option>
+      <option value="Icebreaker">Icebreaker (4–6 min)</option>
+      <option value="Speech">Speech / Prepared (5–7 min)</option>
+
+      <!-- Contest labels: default mapped to the closest typical segment;
+           edit Min/Max if your rulebook differs -->
+      <option value="International Speech Contest">International Speech Contest (default 5–7 min)</option>
+      <option value="Evaluation Contest">Evaluation Contest (default 2–3 min)</option>
+
+      <option value="Custom">Custom (manual)</option>
+    </select>
+
+    <input id="contestantInput" type="text" placeholder="Contestant # (e.g., 3)" />
+    <input id="nameInput" type="text" placeholder="Speaker name (e.g., Devi)" />
+    <input id="topicInput" type="text" placeholder="Speech topic (e.g., The Calm Within the Chaos)" />
+
+    <input id="minInput" type="number" min="0" value="60" title="Minimum seconds" />
+    <input id="maxInput" type="number" min="0" value="120" title="Maximum seconds" />
+
+    <button id="addBtn">Add Speaker</button>
+    <button id="resetAllBtn" title="Clears all speakers and times">Reset All</button>
+  </div>
+
+  <div class="row">
+    <button id="exportBtn">Export CSV</button>
+    <span class="muted small">Tip: Starting a new speaker auto-stops the currently running one.</span>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th class="nowrap">#</th>
+        <th>Speaker</th>
+        <th>Topic</th>
+        <th class="nowrap">Segment</th>
+        <th class="nowrap">Min (s)</th>
+        <th class="nowrap">Max (s)</th>
+        <th class="nowrap">Status</th>
+        <th class="nowrap">Current</th>
+        <th class="nowrap">Total</th>
+        <th class="right">Actions</th>
+      </tr>
+    </thead>
+    <tbody id="tbody"></tbody>
+  </table>
+
+<script>
+(() => {
+  const LS_KEY = "speaker_timer_contest_v4_segment_dropdown";
+  const $ = (id) => document.getElementById(id);
+
+  // Presets (seconds) grounded in documented "typical times" and TTM script:
+  // Meeting-Roles typical times: Table Topics 1–2, Evaluation 2–3, Icebreaker 4–6, Speeches 5–7 [1](https://microsoft.sharepoint.com/teams/ToastMasters-MicrosoftEarlyBirds/SitePages/Meeting-Roles.aspx?web=1)
+  // TTM Script confirms Table Topics 1–2 with 30s grace [2](https://microsoftapc-my.sharepoint.com/personal/rmanukonda_microsoft_com/_layouts/15/Doc.aspx?sourcedoc=%7BD1F2B370-3FDF-41E6-904D-B41B9CDA88C5%7D&file=TABLE%20TOPICS%20MASTER-Script%202.docx&action=default&mobileredirect=true&DefaultItemOpen=1)
+  const PRESETS = {
+    "Table Topics": { min: 60,  max: 120 }, // 1–2 min
+    "Evaluation":   { min: 120, max: 180 }, // 2–3 min
+    "General Evaluation": { min: 120, max: 180 }, // 2–3 min
+    "Icebreaker":   { min: 240, max: 360 }, // 4–6 min
+    "Speech":       { min: 300, max: 420 }, // 5–7 min
+
+    // Contest labels default to closest "typical times" (edit if needed)
+    "International Speech Contest": { min: 300, max: 420 },
+    "Evaluation Contest": { min: 120, max: 180 },
+
+    "Custom":       { min: null, max: null }
+  };
+
+  let speakers = load() || [];
+  // speaker: { id, contestantNumber, name, topic, segment, minSec, maxSec, totalMs, running, startedAtMs }
+  let tickHandle = null;
+
+  function save() { localStorage.setItem(LS_KEY, JSON.stringify(speakers)); }
+  function load() { try { return JSON.parse(localStorage.getItem(LS_KEY)); } catch { return null; } }
+
+  function msToHMS(ms) {
+    const totalSec = Math.floor(ms / 1000);
+    const h = Math.floor(totalSec / 3600);
+    const m = Math.floor((totalSec % 3600) / 60);
+    const s = totalSec % 60;
+    const pad = (n) => String(n).padStart(2,"0");
+    return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+  }
+
+  function escapeHtml(str) {
+    return String(str ?? "").replace(/[&<>"']/g, (c) => ({
+      "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+    }[c]));
+  }
+
+  function bufferSec() {
+    const v = Number($("bufferInput").value);
+    return Number.isFinite(v) && v >= 0 ? v : 30;
+  }
+
+  function currentSessionMs(sp) {
+    return sp.running ? (Date.now() - sp.startedAtMs) : 0;
+  }
+
+  // Status logic:
+  // Green: min..max
+  // Yellow: [min-buffer, min) OR (max, max+buffer]
+  // Red: < min-buffer OR > max+buffer
+  function getStatus(totalSec, minSec, maxSec, buf) {
+    const lowGrace = minSec - buf;
+    const highGrace = maxSec + buf;
+
+    if (totalSec < lowGrace || totalSec > highGrace) return { key:"RED", qualified:false };
+    if (totalSec >= minSec && totalSec <= maxSec) return { key:"GREEN", qualified:true };
+    return { key:"YELLOW", qualified:true };
+  }
+
+  function statusPill(statusKey) {
+    if (statusKey === "GREEN") return `<span class="pill pill-green">QUALIFIED (IN LIMIT)</span>`;
+    if (statusKey === "YELLOW") return `<span class="pill pill-yellow">QUALIFIED (BUFFER)</span>`;
+    return `<span class="pill pill-red">NOT QUALIFIED</span>`;
+  }
+
+  function rowClass(statusKey) {
+    if (statusKey === "GREEN") return "row-green";
+    if (statusKey === "YELLOW") return "row-yellow";
+    return "row-red";
+  }
+
+  function render() {
+    const tbody = $("tbody");
+    tbody.innerHTML = "";
+    if (speakers.length === 0) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td colspan="10" class="muted">No speakers yet. Add details above.</td>`;
+      tbody.appendChild(tr);
+      return;
+    }
+
+    const buf = bufferSec();
+
+    const sorted = [...speakers].sort((a,b) => {
+      const na = Number(a.contestantNumber), nb = Number(b.contestantNumber);
+      if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
+      return String(a.contestantNumber).localeCompare(String(b.contestantNumber));
+    });
+
+    for (const sp of sorted) {
+      const sessionMs = currentSessionMs(sp);
+      const totalMs = sp.totalMs + sessionMs;
+      const totalSec = Math.floor(totalMs / 1000);
+
+      const minSec = Number(sp.minSec) || 0;
+      const maxSec = Number(sp.maxSec) || 0;
+
+      const st = getStatus(totalSec, minSec, maxSec, buf);
+
+      const tr = document.createElement("tr");
+      tr.classList.add(rowClass(st.key));
+      if (sp.running) tr.classList.add("active");
+
+      tr.innerHTML = `
+        <td class="nowrap"><strong>${escapeHtml(sp.contestantNumber)}</strong></td>
+        <td>
+          <strong>${escapeHtml(sp.name)}</strong>
+          ${sp.running ? `<span class="pill pill-green">RUNNING</span>` : ``}
+        </td>
+        <td>${escapeHtml(sp.topic)}</td>
+        <td class="nowrap">${escapeHtml(sp.segment || "")}</td>
+
+        <td class="nowrap">
+          <input class="cell-input" type="number" min="0" data-act="edit-min" data-id="${sp.id}" value="${escapeHtml(minSec)}" />
+        </td>
+        <td class="nowrap">
+          <input class="cell-input" type="number" min="0" data-act="edit-max" data-id="${sp.id}" value="${escapeHtml(maxSec)}" />
+        </td>
+
+        <td class="nowrap">${statusPill(st.key)}</td>
+        <td class="nowrap">${msToHMS(sessionMs)}</td>
+        <td class="nowrap"><strong>${msToHMS(totalMs)}</strong></td>
+        <td class="right">
+          <button data-act="toggle" data-id="${sp.id}">${sp.running ? "Stop" : "Start"}</button>
+          <button data-act="reset" data-id="${sp.id}" title="Reset this speaker’s time">Reset</button>
+          <button data-act="remove" data-id="${sp.id}" title="Remove speaker">Remove</button>
+        </td>
+      `;
+      tbody.appendChild(tr);
+    }
+  }
+
+  function ensureTicking() {
+    const anyRunning = speakers.some(s => s.running);
+    if (anyRunning && !tickHandle) tickHandle = setInterval(render, 250);
+    if (!anyRunning && tickHandle) { clearInterval(tickHandle); tickHandle = null; }
+  }
+
+  function stopSpeaker(sp) {
+    if (!sp.running) return;
+    sp.totalMs += (Date.now() - sp.startedAtMs);
+    sp.running = false;
+    sp.startedAtMs = 0;
+  }
+
+  function startSpeaker(sp) {
+    for (const other of speakers) {
+      if (other.running && other.id !== sp.id) stopSpeaker(other);
+    }
+    sp.running = true;
+    sp.startedAtMs = Date.now();
+  }
+
+  function toggleSpeaker(id) {
+    const sp = speakers.find(s => s.id === id);
+    if (!sp) return;
+    if (sp.running) stopSpeaker(sp);
+    else startSpeaker(sp);
+    save();
+    ensureTicking();
+    render();
+  }
+
+  function resetSpeaker(id) {
+    const sp = speakers.find(s => s.id === id);
+    if (!sp) return;
+    sp.totalMs = 0;
+    sp.running = false;
+    sp.startedAtMs = 0;
+    save();
+    ensureTicking();
+    render();
+  }
+
+  function removeSpeaker(id) {
+    const sp = speakers.find(s => s.id === id);
+    if (sp?.running) stopSpeaker(sp);
+    speakers = speakers.filter(s => s.id !== id);
+    save();
+    ensureTicking();
+    render();
+  }
+
+  function resetAll() {
+    speakers = [];
+    save();
+    ensureTicking();
+    render();
+  }
+
+  function applyPresetToInputs(segment) {
+    const p = PRESETS[segment] || PRESETS["Custom"];
+    if (p.min != null) $("minInput").value = p.min;
+    if (p.max != null) $("maxInput").value = p.max;
+  }
+
+  function addSpeakerFromInputs() {
+    const segment = $("segmentSelect").value;
+    const contestantNumber = $("contestantInput").value.trim();
+    const name = $("nameInput").value.trim();
+    const topic = $("topicInput").value.trim();
+    const minSec = Number($("minInput").value);
+    const maxSec = Number($("maxInput").value);
+
+    if (!name) return;
+
+    speakers.push({
+      id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random()),
+      contestantNumber: contestantNumber || "",
+      name,
+      topic: topic || "",
+      segment: segment || "",
+      minSec: Number.isFinite(minSec) ? minSec : 0,
+      maxSec: Number.isFinite(maxSec) ? maxSec : 0,
+      totalMs: 0,
+      running: false,
+      startedAtMs: 0
+    });
+
+    $("contestantInput").value = "";
+    $("nameInput").value = "";
+    $("topicInput").value = "";
+    $("contestantInput").focus();
+
+    save();
+    render();
+  }
+
+  function updateMinMax(id, field, value) {
+    const sp = speakers.find(s => s.id === id);
+    if (!sp) return;
+    const v = Number(value);
+    if (!Number.isFinite(v) || v < 0) return;
+    sp[field] = v;
+    save();
+    render();
+  }
+
+  function exportCSV() {
+    const buf = bufferSec();
+    const rows = [[
+      "ContestantNumber",
+      "SpeakerName",
+      "SpeechTopic",
+      "Segment",
+      "MinSeconds",
+      "MaxSeconds",
+      "BufferSeconds",
+      "TotalTime(h:mm:ss)",
+      "Status",
+      "Qualified"
+    ]];
+
+    for (const sp of speakers) {
+      const totalMs = sp.totalMs + (sp.running ? (Date.now() - sp.startedAtMs) : 0);
+      const totalSec = Math.floor(totalMs / 1000);
+      const minSec = Number(sp.minSec) || 0;
+      const maxSec = Number(sp.maxSec) || 0;
+      const st = getStatus(totalSec, minSec, maxSec, buf);
+
+      rows.push([
+        sp.contestantNumber,
+        sp.name,
+        sp.topic,
+        sp.segment,
+        String(minSec),
+        String(maxSec),
+        String(buf),
+        msToHMS(totalMs),
+        st.key,
+        st.qualified ? "Yes" : "No"
+      ]);
+    }
+
+    const csv = rows
+      .map(r => r.map(v => `"${String(v ?? "").replaceAll('"','""')}"`).join(","))
+      .join("\n");
+
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `speaker-timer-segmented.csv`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  // UI wiring
+  $("segmentSelect").addEventListener("change", (e) => {
+    applyPresetToInputs(e.target.value);
+  });
+
+  $("addBtn").addEventListener("click", addSpeakerFromInputs);
+  ["contestantInput","nameInput","topicInput","minInput","maxInput"].forEach(id => {
+    $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") addSpeakerFromInputs(); });
+  });
+
+  $("resetAllBtn").addEventListener("click", resetAll);
+  $("exportBtn").addEventListener("click", exportCSV);
+
+  $("tbody").addEventListener("click", (e) => {
+    const btn = e.target.closest("button");
+    if (!btn) return;
+    const act = btn.dataset.act;
+    const id = btn.dataset.id;
+    if (act === "toggle") toggleSpeaker(id);
+    if (act === "reset") resetSpeaker(id);
+    if (act === "remove") removeSpeaker(id);
+  });
+
+  $("tbody").addEventListener("input", (e) => {
+    const inp = e.target.closest("input");
+    if (!inp) return;
+    const act = inp.dataset.act;
+    const id = inp.dataset.id;
+    if (act === "edit-min") updateMinMax(id, "minSec", inp.value);
+    if (act === "edit-max") updateMinMax(id, "maxSec", inp.value);
+  });
+
+  $("bufferInput").addEventListener("input", () => render());
+
+  // Initialize default preset on load
+  applyPresetToInputs($("segmentSelect").value);
+
+  render();
+  ensureTicking();
+})();
+</script>
+</body>
+</html>
